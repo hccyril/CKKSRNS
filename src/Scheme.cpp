@@ -15,6 +15,14 @@ Scheme::Scheme(SecretKey& secretKey, Context& context) : context(context) {
 	addMultKey(secretKey);
 }
 
+// ============================================================================
+// addEncKey —— 论文 §4 KeyGen: 公钥生成
+// 生成 pk = (b, a)，满足 b + a·s ≈ e (mod Q_L)
+// 其中 a ← R_Q（均匀随机），e ← χ_err（高斯误差）
+//
+// 加密使用: ct = v·pk + (m+e0, e1)
+// 解密验证: bx + ax·s = v·b + e1 + (v·a + e0)·s = v·(b+a·s) + e1 + e0·s ≈ m
+// ============================================================================
 void Scheme::addEncKey(SecretKey& secretKey) {
 	uint64_t* ex = new uint64_t[context.L << context.logN]();
 	uint64_t* ax = new uint64_t[context.L << context.logN]();
@@ -33,6 +41,19 @@ void Scheme::addEncKey(SecretKey& secretKey) {
 	keyMap.insert(pair<long, Key>(ENCRYPTION, Key(ax, bx)));
 }
 
+// ============================================================================
+// addMultKey —— 论文 §4 KSGen(s², s): 乘法重线性化密钥生成
+// 生成 evk = (b, a) ∈ R_{P·Q}^2，满足 b + a·s ≈ P·s² + e (mod P·Q)
+//
+// 步骤:
+//   1. sxsx = s²（在 NTT 域逐点平方）
+//   2. evalAndEqual(sxsx): 乘以 P（将 s² 嵌入到 P·Q 大环中）
+//   3. e ← χ_err, ex = P·s² + e
+//   4. a ← R_{P·Q}（均匀随机）
+//   5. b = ex - a·s
+//
+// 在 Mult 中: u2·evk → ModDown → u2·s²（重线性化完成）
+// ============================================================================
 void Scheme::addMultKey(SecretKey& secretKey) {
 	uint64_t* ex = new uint64_t[(context.L + context.K) << context.logN]();
 	uint64_t* ax = new uint64_t[(context.L + context.K) << context.logN]();
@@ -160,6 +181,17 @@ Ciphertext Scheme::encryptMsg(SecretKey& secretkey, Plaintext& message) {
 }
 
 
+// ============================================================================
+// encryptMsg (公钥加密) —— 论文 §4 Enc_pk(m)
+// ct = v·pk + (m+e0, e1) = (v·b + m + e0, v·a + e1)
+//
+// 步骤:
+//   1. v ← χ_enc（{0,±1} 采样）
+//   2. e0 ← χ_err
+//   3. ax = v·pk.ax + e0
+//   4. bx = v·pk.bx + e1 + m
+// 解密: bx + ax·s = v·(b+a·s) + m + e0 + e1·s ≈ m（噪声小时）
+// ============================================================================
 Ciphertext Scheme::encryptMsg(Plaintext& message) {
 	Key key = keyMap.at(ENCRYPTION);
 
@@ -189,6 +221,14 @@ Ciphertext Scheme::encryptMsg(Plaintext& message) {
 	return Ciphertext(ax, bx, context.N, message.slots, message.l);
 }
 
+// ============================================================================
+// decryptMsg —— 论文 §4 Dec_sk(ct)
+// 对 ct = (ax, bx)，计算 mx = ax·s + bx (mod q_0)
+//
+// 注意: C++ 代码中 ax 对应 c₁，bx 对应 c₀
+// 解密公式: c₀ + c₁·s = bx + ax·s
+// 结果 mx 是带噪声的缩放明文，需经 decode 恢复复数
+// ============================================================================
 Plaintext Scheme::decryptMsg(SecretKey& secretKey, Ciphertext& cipher) {
 	uint64_t* mx = new uint64_t[context.N]();
 	context.mul(mx, cipher.ax, secretKey.sx, 1);
@@ -292,6 +332,24 @@ void Scheme::sub2AndEqual(Ciphertext& cipher1, Ciphertext& cipher2) {
 	context.sub2AndEqual(cipher1.bx, cipher2.bx, cipher1.l);
 }
 
+// ============================================================================
+// mult —— 论文 §4 Mult_{evk}(ct₁, ct₂): 同态乘法（含重线性化）
+// 这是整个方案中最复杂的操作
+//
+// 设 ct₁ = (a₁, b₁), ct₂ = (a₂, b₂)，解密分别是 b₁+a₁·s 与 b₂+a₂·s
+// 直接相乘得三项: u0=a₁a₂(s²项), u1=a₁b₂+b₁a₂(s项), u2=b₁b₂(常数项)
+//
+// 使用 Karatsuba 优化: u1 = (a₁+b₁)(a₂+b₂) - u0 - u2
+//
+// 步骤:
+//   Step 1: 在 C 基上计算三项乘积 (u0, u1, u2)
+//   Step 2: raise(u0): ModUp_{C→D} 扩展到 D = B∪C 基
+//   Step 3: mulKey: u0 · evk（在 D 基上逐点乘评估密钥）
+//   Step 4: back: ModDown_{D→C} 近似除以 P
+//   Step 5: 组合: res.ax = u0_key + u1 - u2 - u0, res.bx = u0_key + u2
+//
+// 结果: res = (bx+ax·s) ≈ (b₁+a₁s)(b₂+a₂s)（重线性化消除了 s² 项）
+// ============================================================================
 Ciphertext Scheme::mult(Ciphertext& cipher1, Ciphertext& cipher2) {
 	uint64_t* axbx1 = new uint64_t[cipher1.l << context.logN]();
 	uint64_t* axbx2 = new uint64_t[cipher1.l << context.logN]();
@@ -625,6 +683,17 @@ Ciphertext Scheme::reScaleBy(Ciphertext& cipher, long dl) {
 	return res;
 }
 
+// ============================================================================
+// reScaleByAndEqual —— 论文 §4 RS: 重缩放
+// 对密文执行 dl 次 rescale 操作，每次丢弃最高层模数并除以该模数
+//
+// 每次 rescale:
+//   - level 减 1
+//   - scale 从 Δ² 恢复到 ≈Δ
+//   - 引入误差: |c mod q_l| / q_l（论文 §3.1 approximate basis 误差）
+//
+// 在乘法后必须执行 rescale，否则 scale 会指数增长
+// ============================================================================
 void Scheme::reScaleByAndEqual(Ciphertext& cipher, long dl) {
 	for (long i = 0; i < dl; ++i) {
 		context.reScaleAndEqual(cipher.ax, cipher.l);
@@ -665,6 +734,20 @@ void Scheme::modDownToAndEqual(Ciphertext& cipher, long l) {
 	modDownByAndEqual(cipher, dl);
 }
 
+// ============================================================================
+// leftRotateFast —— 论文 §4 LeftRotate: 快速左旋转
+// 将密文的 slot 循环左移 rotSlots 个位置
+//
+// 步骤:
+//   1. bxrot = leftRot(bx, rot): 直接旋转 bx 分量
+//   2. bx_rot = leftRot(ax, rot): 旋转 ax 分量
+//   3. raise(bx_rot): ModUp 扩展到 D 基
+//   4. mulKey: bx_rot · evk_rot（key switching）
+//   5. back: ModDown 缩回 C 基
+//   6. res.bx += bxrot: 加回旋转后的 bx
+//
+// 结果: 每个 slot 的值向左循环移动 rotSlots 个位置
+// ============================================================================
 Ciphertext Scheme::leftRotateFast(Ciphertext& cipher, long rotSlots) {
 	uint64_t* bxrot = new uint64_t[cipher.l << context.logN]();
 	uint64_t* bx = new uint64_t[cipher.l << context.logN]();
@@ -762,6 +845,19 @@ void Scheme::rightRotateAndEqual(Ciphertext& cipher, long rotSlots) {
 	}
 }
 
+// ============================================================================
+// conjugate —— 论文 §4 Conjugate: 复共轭操作
+// 将密文的每个 slot 取复共轭: z → z̄
+//
+// 在多项式层面: a(X) → a(X^{-1})（系数反转）
+// 步骤与 leftRotateFast 类似，但用共轭替代旋转:
+//   1. bxconj = conjugate(bx), bx_rot = conjugate(ax)
+//   2. raise + mulKey(evk_conj) + back: key switching
+//   3. res.bx += bxconj
+//
+// 注意: 共轭改变了 secret key（从 s 变为 s̄），
+// 因此需要专门的评估密钥 evk_conj = KSGen(s̄, s)
+// ============================================================================
 Ciphertext Scheme::conjugate(Ciphertext& cipher) {
 	uint64_t* bxconj = new uint64_t[context.N * cipher.l];
 	uint64_t* bx = new uint64_t[context.N * cipher.l];

@@ -6,6 +6,16 @@
 * work.  If not, see <http://creativecommons.org/licenses/by-nc/3.0/>.
 */
 
+// ============================================================================
+// TestScheme.cpp —— 测试入口实现
+// 包含 ~14 种测试函数，覆盖 HEAAN 方案的所有核心操作
+// 每个测试函数的标准流程:
+//   1. 初始化 Context + SecretKey + Scheme（自动 KeyGen）
+//   2. 生成随机测试数据
+//   3. 执行同态操作
+//   4. 解密并与明文结果对比
+//   5. 用 StringUtils::showcompare 打印误差
+// ============================================================================
 #include "TestScheme.h"
 #include "Numb.h"
 #include "Context.h"
@@ -23,6 +33,12 @@
 using namespace std;
 using namespace chrono;
 
+// ============================================================================
+// testEncodeSingle —— 单值编码/解码测试
+// 验证: Encode → Enc → Dec → Decode 的端到端正确性
+// 输入: 一个单位圆上的随机复数 m
+// 期望: 解密结果 d ≈ m（误差来自编码舍入 + 加密噪声）
+// ============================================================================
 void TestScheme::testEncodeSingle(long logN, long L, long logp) {
 	cout << "!!! START TEST ENCODE SINGLE !!!" << endl;
 	//-----------------------------------------
@@ -76,6 +92,14 @@ void TestScheme::testEncodeBatch(long logN, long L, long logp, long logSlots) {
 	cout << "!!! END TEST ENCODE BATCH !!!" << endl;
 }
 
+// ============================================================================
+// testBasic —— 基本同态运算测试
+// 测试三个操作:
+//   1. 同态加法: Enc(m1) + Enc(m2) → Dec ≈ m1 + m2
+//   2. 同态乘法 + Rescale: Enc(m1) ⊗ Enc(m2) + RS → Dec ≈ m1 * m2
+//   3. 常数向量乘法 + Rescale: Enc(m1) ⊙ c + RS → Dec ≈ m1 * c
+// 这是最核心的测试，验证了 CKKS 方案的基本功能
+// ============================================================================
 void TestScheme::testBasic(long logN, long L, long logp, long logSlots) {
 	cout << "!!! START TEST BASIC !!!" << endl;
 	//-----------------------------------------

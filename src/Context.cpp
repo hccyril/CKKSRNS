@@ -11,6 +11,28 @@
 #include "Context.h"
 #include "EvaluatorUtils.h"
 
+// ============================================================================
+// 构造函数 —— 论文 §4 Setup(q, L, ε; λ) 的完整实现
+// 这是整个项目中最大的函数，完成所有参数初始化和预计算表构建
+//
+// 参数（论文 §4 表 1）:
+//   logN: log₂(N)，环维度对数（典型值 14-16）
+//   logp: log₂(Δ)，缩放因子对数（典型值 30-60）
+//   L:    最大 level（密文模数链长度，典型值 5-30）
+//   K:    特殊模数个数（通常 K = L+1，用于 key switching）
+//   h:    秘密密钥汉明重量（默认 64，论文附录 A）
+//   sigma: 高斯误差标准差（默认 3.2）
+//
+// 构造流程:
+//   Step 1: 计算基础参数 N, M, Nh, p
+//   Step 2: 生成 L 个密文模数 qVec（论文 §3.1 approximate basis）
+//   Step 3: 预计算 NTT 相关表（旋转因子、幂次表、Montgomery 形式）
+//   Step 4: 生成 K 个特殊模数 pVec
+//   Step 5: 预计算基转换表（qHat, pHat 及其逆元）
+//   Step 6: 预计算 P/Q 模逆表
+//   Step 7: 预计算旋转群、复数单位根
+//   Step 8: 预计算 Taylor 系数和常数多项式
+// ============================================================================
 Context::Context(long logN, long logp, long L, long K, long h, double sigma) :
 		logN(logN), logp(logp), L(L), K(K), h(h), sigma(sigma) {
 
@@ -500,6 +522,16 @@ void Context::encodeSingle(uint64_t* ax, double val, long l) {
 
 }
 
+// ============================================================================
+// decode —— 论文 §2.1 CKKS 解码: Decode(m) = σ(m) / Δ
+// 将多项式在 N/2 个 slot 上求值，除以缩放因子恢复复数
+//
+// 步骤:
+//   1. 拷贝第一层（q_0）上的多项式系数
+//   2. qiINTT: 从 NTT 表示转回系数表示
+//   3. 提取实部/虚部: 对每个 slot 的中心代表元除以 p
+//   4. fftSpecial: CKKS 专用正 FFT，得到最终的复数向量
+// ============================================================================
 void Context::decode(uint64_t* a, complex<double>* v, long slots, long l) {
 	uint64_t* tmp = new uint64_t[N]();
 	copy(a, a + N, tmp);
@@ -562,6 +594,21 @@ void Context::NTT(uint64_t* res, uint64_t* a, long l, long k) {
 	}
 }
 
+// ============================================================================
+// qiNTTAndEqual —— 论文 §2.2 数论变换 (NTT) 的原地实现
+// 使用 Cooley-Tukey 蝶形算法，将多项式从系数表示转为 NTT 表示
+// 在 NTT 表示下，环乘法变为逐点相乘，复杂度从 O(N²) 降为 O(N)
+//
+// 算法:
+//   for m = 1, 2, 4, ..., N/2:       (共 log₂N 层蝶形)
+//     for i = 0..m-1:                 (每层 m 组蝶形)
+//       W = qRootScalePows[m+i]       (旋转因子，Montgomery 形式)
+//       for j in group:               (每组 N/(2m) 个蝶形)
+//         T = a[j+t]
+//         U = T * W                   (Montgomery 乘法)
+//         a[j+t] = a[j] - U           (蝶形下支)
+//         a[j] = a[j] + U             (蝶形上支)
+// ============================================================================
 void Context::qiNTTAndEqual(uint64_t* a, long index) {
 	long t = N;
 	long logt1 = logN + 1;
@@ -1225,6 +1272,20 @@ void Context::squareAndEqual(uint64_t* a, long l, long k) {
 	}
 }
 
+// ============================================================================
+// evalAndEqual —— 论文 §4 KSGen 中的 P 因子注入
+// 将多项式的每个 C 基分量乘以 P = Π p_i (特殊模数乘积)
+//
+// 步骤:
+//   1. INTT: 将 l 个分量从 NTT 转回系数
+//   2. 对每个分量: a_i *= PModq[i] mod q_i
+//      即 a_i 在整数意义上被乘以了 P
+//   3. NTT: 转回 NTT 表示
+//
+// 在 KSGen 中，对 s² 执行 evalAndEqual，使得:
+//   s² → P·s² (mod P·Q)
+// 这样 key switching 后 ModDown 近似除以 P 就能得到 s²
+// ============================================================================
 void Context::evalAndEqual(uint64_t* a, long l) {
 	INTTAndEqual(a, l);
 	for (long i = 0; i < l; ++i) {
@@ -1241,6 +1302,19 @@ void Context::raise(uint64_t* res, uint64_t* a, long l) {
 
 }
 
+// ============================================================================
+// raiseAndEqual —— 论文 §3.2 Algorithm 1: ModUp_{C→D}
+// 将多项式从 C 基（密文模数 {q_0,...,q_{l-1}}）扩展到 D 基（D = B∪C）
+// 即增加特殊基 B = {p_0,...,p_{K-1}} 上的分量
+//
+// 步骤:
+//   1. 分配新的 (l+K)*N 大小的数组 ra
+//   2. INTT: 将 C 基分量从 NTT 转回系数表示
+//   3. 对每个系数乘以 qHatInvModq（准备基转换）
+//   4. 计算 B 基分量: rak[n] = Σ_i tmp_i[n] * qHatModp[i][k] mod p_k
+//      这就是论文 §2.3 的 Fast Basis Conversion Conv_{C→B}
+//   5. NTT: 将 B 基分量转为 NTT 表示
+// ============================================================================
 void Context::raiseAndEqual(uint64_t*& a, long l) {
 	uint64_t* ra = new uint64_t[(l + K) << logN]();
 	copy(a, a + (l << logN), ra);
@@ -1308,6 +1382,20 @@ void Context::back(uint64_t* res, uint64_t* a, long l) {
 	NTTAndEqual(res, l);
 }
 
+// ============================================================================
+// backAndEqual —— 论文 §3.2 Algorithm 2: ModDown_{D→C}
+// 将多项式从 D 基（D = B∪C）缩回 C 基，近似除以 P = Π p_i
+//
+// 步骤:
+//   1. INTT: 将所有 (l+K) 个分量从 NTT 转回系数
+//   2. 对 B 分量乘 pHatInvModp（准备基转换）
+//   3. 计算 C 基上的近似值: res = Σ_k tmp_k * pHatModq[k][i] mod q_i
+//      这就是论文 §2.3 的 Fast Basis Conversion Conv_{B→C}
+//   4. 减原值并除以 P: res = (a_C - res) * P^{-1} mod q_i
+//      等价于: (b - a) / P，其中 a ≈ b (mod P)
+//   5. NTT: 将结果转回 NTT 表示
+//   6. 丢弃 B 分量，只保留 C 基部分
+// ============================================================================
 void Context::backAndEqual(uint64_t*& a, long l) {
 
 	INTTAndEqual(a, l, K);
@@ -1347,6 +1435,24 @@ void Context::reScale(uint64_t* res, uint64_t* a, long l) {
 	//TODO implement method
 }
 
+// ============================================================================
+// reScaleAndEqual —— 论文 §4 RS_{l,l-1}: Rescaling (重缩放)
+// 丢弃最高层模数 q_{l-1}，并将剩余模数上的值除以 q_{l-1}
+// 这是 CKKS 方案中控制噪声增长的关键操作
+//
+// 效果: scale 从 Δ² 恢复到 ≈Δ，level 减 1
+// 误差来源: |c^{(l)} mod q_j| / q_j（论文 §3.1 approximate basis 误差）
+//
+// 步骤:
+//   1. 取最高层分量 al = a + (l-1)*N
+//   2. qiINTT: 将 al 从 NTT 转回系数表示
+//   3. 对每个剩余模数 q_i:
+//      a. rai = al mod q_i（取 al 在 q_i 上的值）
+//      b. qiNTT: rai 转 NTT
+//      c. rai = (a_i - rai) * q_l^{-1} mod q_i
+//         等价于: (a - a mod q_l) / q_l
+//   4. 丢弃最高层，分配 (l-1)*N 的新数组
+// ============================================================================
 void Context::reScaleAndEqual(uint64_t*& a, long l) {
 	uint64_t* ra = new uint64_t[(l - 1) << logN]();
 	uint64_t* al = a + ((l - 1) << logN);
@@ -1384,6 +1490,22 @@ uint64_t* Context::modDown(uint64_t* a, long l, long dl) {
 	return ra;
 }
 
+// ============================================================================
+// leftRot —— 论文 §4 LeftRotate: 左旋转操作
+// 将多项式 a(X) 映射为 a(X^{5^rotSlots})
+// 其中 5 是 Z_{2N}^* 的生成元
+//
+// 在 canonical embedding 下，这对应于将 slot 循环左移 rotSlots 个位置:
+//   [z_0, z_1, ..., z_{N/2-1}] → [z_{rotSlots}, z_{rotSlots+1}, ..., z_{rotSlots-1}]
+//
+// 步骤:
+//   1. INTT: 将 NTT 转回系数表示
+//   2. 对每个系数 a[n]:
+//      shift = n * rotGroup[rotSlots] mod M  (M = 2N)
+//      if shift < N: res[shift] = a[n]        (X^shift 项系数不变)
+//      else: res[shift-N] = q_i - a[n]        (X^shift = -X^{shift-N})
+//   3. NTT: 转回 NTT 表示
+// ============================================================================
 void Context::leftRot(uint64_t* res, uint64_t* a, long l, long rotSlots) {
 //	long idx = rotSlots % Nh;
 //	for (long n = 0; n < N; ++n) {
@@ -1480,6 +1602,13 @@ void Context::mulByMonomialAndEqual(uint64_t* a, long l, long mdeg) {
 
 }
 
+// ============================================================================
+// sampleGauss —— 论文 §4 χ_err 分布: 离散高斯采样
+// 使用 Box-Muller 变换生成离散高斯随机数
+// 参数 sigma = 3.2（构造函数默认值）
+// 生成的误差多项式 e 的系数服从 N(0, σ²) 的离散化
+// 在加密和 key switching 中使用，控制密文噪声
+// ============================================================================
 void Context::sampleGauss(uint64_t* res, long l, long k) {
 	static long const bignum = 0xfffffff;
 	for (long i = 0; i < N; i += 2) {
@@ -1533,6 +1662,13 @@ void Context::sampleUniform(uint64_t* res, long l, long k) {
 	}
 }
 
+// ============================================================================
+// sampleHWT —— 论文 §4 χ_key 分布: 汉明重量采样
+// 生成汉明重量为 h 的稀疏三元多项式（系数 ∈ {-1, 0, 1}）
+// 恰好 h 个非零系数，每个非零系数等概率为 +1 或 -1
+// 用于秘密密钥 s 的生成（论文 KeyGen 的第一步）
+// 小汉明重量使 ||s|| 可控，有利于噪声分析（论文附录 A）
+// ============================================================================
 void Context::sampleHWT(uint64_t* res, long l, long k) {
 	long idx = 0;
 	while (idx < h) {

@@ -6,6 +6,15 @@
 * work.  If not, see <http://creativecommons.org/licenses/by-nc/3.0/>.
 */
 
+// ============================================================================
+// SchemeAlgo.cpp —— 高阶算法实现
+// 基于 Scheme 的基本同态运算构建复杂算法:
+//   - 幂运算: 反复平方 + rescale
+//   - 乘积: 树状乘法
+//   - 求逆: 1/(1-x) 的截断几何级数
+//   - 指数/sigmoid: Taylor 级数展开
+//   - 同态 FFT: 在密文数组上执行 FFT
+// ============================================================================
 #include "SchemeAlgo.h"
 
 //----------------------------------------------------------------------------------
@@ -42,6 +51,13 @@ complex<double>* SchemeAlgo::decryptSingleArray(SecretKey& secretKey, Ciphertext
 //----------------------------------------------------------------------------------
 
 
+// ============================================================================
+// powerOf2 —— 计算 cipher^{2^logDegree}
+// 通过反复平方实现: cipher → cipher² → cipher⁴ → ... → cipher^{2^logDegree}
+// 每次平方后执行 rescale 将 scale 从 Δ² 恢复到 Δ
+// 总消耗: logDegree 次乘法 + logDegree 次 rescale
+// 消耗 logDegree 层 level
+// ============================================================================
 Ciphertext SchemeAlgo::powerOf2(Ciphertext& cipher, const long logDegree) {
 	Ciphertext res = cipher;
 	for (long i = 0; i < logDegree; ++i) {
@@ -229,6 +245,17 @@ void SchemeAlgo::partialSlotsSumAndEqual(Ciphertext& cipher, const long slots) {
 //----------------------------------------------------------------------------------
 
 
+// ============================================================================
+// inverse —— 求逆运算: 1/cipher
+// 基于几何级数: 1/(1-x) = 1 + x + x² + x³ + ...
+// 算法（Newton 迭代思路）:
+//   初始化: cbar = 1 - cipher, res = 1 + (1-x) = 2-x
+//   第 i 步: cpow = cpow² (x^{2^i}), res = res * (1 + cpow)
+//   结果收敛到 1/(1-x) 的截断级数
+//
+// 前提: |cipher| < 1（输入需在单位圆内）
+// 精度: 2^steps 次项后的截断误差
+// ============================================================================
 Ciphertext SchemeAlgo::inverse(Ciphertext& cipher, const long steps) {
 	Ciphertext cbar = scheme.negate(cipher);
 	scheme.addConstAndEqual(cbar, 1.0);
@@ -268,6 +295,17 @@ Ciphertext* SchemeAlgo::inverseExtended(Ciphertext& cipher, const long steps) {
 	return res;
 }
 
+// ============================================================================
+// exponent —— 指数函数: exp(cipher)
+// 使用 Taylor 级数展开: exp(x) = 1 + x + x²/2! + x³/3! + ...
+// 步骤:
+//   1. powerExtended: 计算 [cipher, cipher², ..., cipher^degree]
+//   2. 从 taylorCoeffsMap 取 Taylor 系数
+//   3. 线性组合: res = Σ coeffs[i+1] * cipher^i + coeffs[0]
+//   4. rescale: 恢复 scale
+//
+// 论文 §5 函数求值的核心应用之一
+// ============================================================================
 Ciphertext SchemeAlgo::exponent(Ciphertext& cipher, long degree) {
 	Ciphertext* cpows = powerExtended(cipher, degree);
 
@@ -286,6 +324,12 @@ Ciphertext SchemeAlgo::exponent(Ciphertext& cipher, long degree) {
 	return res;
 }
 
+// ============================================================================
+// sigmoid —— Sigmoid 函数: σ(x) = exp(x)/(1+exp(x)) = 1/(1+e^{-x})
+// 使用 Taylor 级数近似（系数预存在 taylorCoeffsMap 中）
+// 实现方式与 exponent 相同，仅系数不同
+// 论文 §5: sigmoid 在机器学习场景中特别重要
+// ============================================================================
 Ciphertext SchemeAlgo::sigmoid(Ciphertext& cipher, long degree) {
 	Ciphertext* cpows = powerExtended(cipher, degree);
 

@@ -1,0 +1,9 @@
+*.pdf
+*.bak
+.agents/
+.claude/
+build/
+build-debug/
+outputs/
+.vs/
+.vscode/
